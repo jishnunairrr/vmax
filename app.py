@@ -71,6 +71,17 @@ TOOLS_NOTE = (
 )
 
 
+_client: httpx.AsyncClient | None = None
+
+
+def http() -> httpx.AsyncClient:
+    """One shared connection pool, so each model call skips the TLS handshake."""
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=20))
+    return _client
+
+
 # ---------------------------------------------------------------- settings --
 def settings() -> dict:
     """API_KEY above wins; a NVIDIA_API_KEY in .env is used if it is empty."""
@@ -256,23 +267,23 @@ async def embed(texts: list[str], input_type: str, cfg: dict) -> np.ndarray:
     """input_type is 'passage' for document chunks and 'query' for questions."""
     out: list[list[float]] = []
     headers = {"Authorization": f"Bearer {cfg['key']}", "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=120) as client:
-        for start in range(0, len(texts), EMBED_BATCH):
-            payload = {
-                "model": cfg["embed_model"],
-                "input": texts[start:start + EMBED_BATCH],
-                "input_type": input_type,
-                "encoding_format": "float",
-                "truncate": "END",
-            }
-            try:
-                res = await client.post(f"{cfg['base']}/embeddings", json=payload, headers=headers)
-            except httpx.HTTPError as exc:
-                raise HTTPException(502, f"Could not reach the model service ({exc.__class__.__name__}).")
-            if res.status_code != 200:
-                raise HTTPException(502, nvidia_error(res.status_code, res.text))
-            rows = sorted(res.json()["data"], key=lambda r: r["index"])
-            out.extend(r["embedding"] for r in rows)
+    client = http()
+    for start in range(0, len(texts), EMBED_BATCH):
+        payload = {
+            "model": cfg["embed_model"],
+            "input": texts[start:start + EMBED_BATCH],
+            "input_type": input_type,
+            "encoding_format": "float",
+            "truncate": "END",
+        }
+        try:
+            res = await client.post(f"{cfg['base']}/embeddings", json=payload, headers=headers, timeout=120)
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"Could not reach the model service ({exc.__class__.__name__}).")
+        if res.status_code != 200:
+            raise HTTPException(502, nvidia_error(res.status_code, res.text))
+        rows = sorted(res.json()["data"], key=lambda r: r["index"])
+        out.extend(r["embedding"] for r in rows)
     vecs = np.asarray(out, dtype=np.float32)
     return vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
 
@@ -318,32 +329,33 @@ WEATHER_CODES = {
 async def get_weather(place: str) -> str:
     """Live weather from Open-Meteo (free, no key)."""
     place = place.strip()
-    async with httpx.AsyncClient(timeout=20) as client:
-        spot = None
-        for name in dict.fromkeys([place, place.split(",")[0].strip()]):
-            res = await client.get(
-                "https://geocoding-api.open-meteo.com/v1/search", params={"name": name, "count": 1}
-            )
-            found = res.json().get("results") if res.status_code == 200 else None
-            if found:
-                spot = found[0]
-                break
-        if not spot:
-            return f"No place called '{place}' was found. Ask the user to check the spelling."
+    client = http()
+    spot = None
+    for name in dict.fromkeys([place, place.split(",")[0].strip()]):
         res = await client.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": spot["latitude"],
-                "longitude": spot["longitude"],
-                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                "timezone": "auto",
-                "forecast_days": 3,
-            },
+            "https://geocoding-api.open-meteo.com/v1/search", params={"name": name, "count": 1}, timeout=20
         )
-        if res.status_code != 200:
-            return "The weather service did not respond. Try again shortly."
-        data = res.json()
+        found = res.json().get("results") if res.status_code == 200 else None
+        if found:
+            spot = found[0]
+            break
+    if not spot:
+        return f"No place called '{place}' was found. Ask the user to check the spelling."
+    res = await client.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": spot["latitude"],
+            "longitude": spot["longitude"],
+            "current": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "timezone": "auto",
+            "forecast_days": 3,
+        },
+        timeout=20,
+    )
+    if res.status_code != 200:
+        return "The weather service did not respond. Try again shortly."
+    data = res.json()
     now, daily = data["current"], data["daily"]
     where = ", ".join(x for x in (spot.get("name"), spot.get("admin1"), spot.get("country")) if x)
     lines = [
@@ -361,26 +373,43 @@ async def get_weather(place: str) -> str:
     return "\n".join(lines)
 
 
-def _search_sync(query: str) -> list[dict]:
+SEARCH_ENGINES = ("yahoo", "bing", "google")
+SEARCH_TIMEOUT = 8  # seconds to wait for the engines before giving up
+
+
+def _search_one(query: str, backend: str) -> list[dict]:
     from ddgs import DDGS
 
-    for backend in ("yahoo", "bing", "google", "auto"):  # each engine fails often; try in turn
-        try:
-            rows = DDGS(timeout=12).text(query, max_results=MAX_WEB_RESULTS, backend=backend)
-        except Exception:
-            continue
-        results = [
-            {"title": r.get("title", ""), "url": r.get("href", ""), "text": r.get("body", "")}
-            for r in rows or []
-            if r.get("href")
-        ]
-        if results:
-            return results
-    return []
+    try:
+        rows = DDGS(timeout=SEARCH_TIMEOUT).text(query, max_results=MAX_WEB_RESULTS, backend=backend)
+    except Exception:
+        return []
+    return [
+        {"title": r.get("title", ""), "url": r.get("href", ""), "text": r.get("body", "")}
+        for r in rows or []
+        if r.get("href")
+    ]
 
 
 async def web_search(query: str) -> list[dict]:
-    return await asyncio.to_thread(_search_sync, query.strip())
+    """Ask every engine at once and use the first that returns results.
+
+    Each free engine fails often and a failure can take several seconds, so
+    trying them one after another made slow searches very slow.
+    """
+    query = query.strip()
+    tasks = [asyncio.create_task(asyncio.to_thread(_search_one, query, b)) for b in SEARCH_ENGINES]
+    try:
+        for done in asyncio.as_completed(tasks, timeout=SEARCH_TIMEOUT + 2):
+            results = await done
+            if results:
+                return results
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        for task in tasks:
+            task.cancel()
+    return []
 
 
 # --------------------------------------------------------------------- api --
@@ -524,114 +553,117 @@ async def chat(req: ChatRequest, request: Request):
         messages[0]["content"] += TOOLS_NOTE.format(today=today)
         headers = {"Authorization": f"Bearer {cfg['key']}", "Accept": "text/event-stream"}
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=20)) as client:
-                for round_no in range(MAX_TOOL_ROUNDS + 1):
-                    payload = {
-                        "model": model,
-                        "messages": messages,
-                        "temperature": 0.2 if sources else 0.6,
-                        "top_p": 0.95,
-                        "max_tokens": 4096,
-                        "stream": True,
-                    }
-                    if round_no < MAX_TOOL_ROUNDS:  # the last round must answer
-                        payload["tools"] = TOOLS
-                        payload["tool_choice"] = "auto"
-                    calls: dict[int, dict] = {}
-                    said = ""
-                    async with client.stream(
-                        "POST", f"{cfg['base']}/chat/completions", json=payload, headers=headers
-                    ) as res:
-                        if res.status_code != 200:
-                            body = (await res.aread()).decode("utf-8", errors="ignore")
-                            yield sse({"type": "error", "message": nvidia_error(res.status_code, body)})
-                            return
-                        async for line in res.aiter_lines():
-                            if not line.startswith("data:"):
-                                continue
-                            data = line[5:].strip()
-                            if data == "[DONE]":
-                                break
-                            try:
-                                choices = json.loads(data).get("choices") or []
-                            except json.JSONDecodeError:
-                                continue
-                            if not choices:
-                                continue
-                            delta = choices[0].get("delta") or {}
-                            for part in delta.get("tool_calls") or []:
-                                call = calls.setdefault(part.get("index", 0), {"id": "", "name": "", "args": ""})
-                                fn = part.get("function") or {}
-                                call["id"] = part.get("id") or call["id"]
-                                call["name"] += fn.get("name") or ""
-                                call["args"] += fn.get("arguments") or ""
-                            if delta.get("content"):
-                                said += delta["content"]
-                                yield sse({"type": "token", "text": delta["content"]})
-                            elif delta.get("reasoning_content") or delta.get("reasoning"):
-                                yield sse({"type": "thinking"})
-                    if not calls:
-                        break
-
-                    ordered = [calls[i] for i in sorted(calls)]
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": said,
-                            "tool_calls": [
-                                {
-                                    "id": c["id"] or f"call_{round_no}_{i}",
-                                    "type": "function",
-                                    "function": {"name": c["name"], "arguments": c["args"] or "{}"},
-                                }
-                                for i, c in enumerate(ordered)
-                            ],
-                        }
-                    )
-                    for i, c in enumerate(ordered):
+            client = http()
+            for round_no in range(MAX_TOOL_ROUNDS + 1):
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.2 if sources else 0.6,
+                    "top_p": 0.95,
+                    "max_tokens": 4096,
+                    "stream": True,
+                    # Hidden reasoning added up to a minute before the first word;
+                    # without it the first token arrives in about a second.
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+                if round_no < MAX_TOOL_ROUNDS:  # the last round must answer
+                    payload["tools"] = TOOLS
+                    payload["tool_choice"] = "auto"
+                calls: dict[int, dict] = {}
+                said = ""
+                async with client.stream(
+                    "POST", f"{cfg['base']}/chat/completions", json=payload, headers=headers
+                ) as res:
+                    if res.status_code != 200:
+                        body = (await res.aread()).decode("utf-8", errors="ignore")
+                        yield sse({"type": "error", "message": nvidia_error(res.status_code, body)})
+                        return
+                    async for line in res.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
                         try:
-                            args = json.loads(c["args"] or "{}")
+                            choices = json.loads(data).get("choices") or []
                         except json.JSONDecodeError:
-                            args = {}
-                        try:
-                            if c["name"] == "get_weather":
-                                place = str(args.get("place", ""))
-                                yield sse({"type": "status", "text": f"Checking the weather in {place}"})
-                                result = await get_weather(place)
-                            elif c["name"] == "web_search":
-                                query = str(args.get("query", ""))
-                                yield sse({"type": "status", "text": f"Searching the web for {query}"})
-                                found = await web_search(query)
-                                for hit in found:
-                                    sources.append(
-                                        {"n": len(sources) + 1, "doc": hit["title"] or hit["url"],
-                                         "page": None, "text": hit["text"], "url": hit["url"]}
-                                    )
-                                    hit["n"] = len(sources)
-                                if found:
-                                    yield sse({"type": "sources", "sources": sources})
-                                    result = "\n\n".join(
-                                        f"[{h['n']}] {h['title']} ({h['url']})\n{h['text']}" for h in found
-                                    )
-                                else:
-                                    result = (
-                                        "The search returned no results. Tell the user the search failed and "
-                                        "answer from what you know, saying it may be out of date."
-                                    )
+                            continue
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        for part in delta.get("tool_calls") or []:
+                            call = calls.setdefault(part.get("index", 0), {"id": "", "name": "", "args": ""})
+                            fn = part.get("function") or {}
+                            call["id"] = part.get("id") or call["id"]
+                            call["name"] += fn.get("name") or ""
+                            call["args"] += fn.get("arguments") or ""
+                        if delta.get("content"):
+                            said += delta["content"]
+                            yield sse({"type": "token", "text": delta["content"]})
+                        elif delta.get("reasoning_content") or delta.get("reasoning"):
+                            yield sse({"type": "thinking"})
+                if not calls:
+                    break
+
+                ordered = [calls[i] for i in sorted(calls)]
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": said,
+                        "tool_calls": [
+                            {
+                                "id": c["id"] or f"call_{round_no}_{i}",
+                                "type": "function",
+                                "function": {"name": c["name"], "arguments": c["args"] or "{}"},
+                            }
+                            for i, c in enumerate(ordered)
+                        ],
+                    }
+                )
+                for i, c in enumerate(ordered):
+                    try:
+                        args = json.loads(c["args"] or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    try:
+                        if c["name"] == "get_weather":
+                            place = str(args.get("place", ""))
+                            yield sse({"type": "status", "text": f"Checking the weather in {place}"})
+                            result = await get_weather(place)
+                        elif c["name"] == "web_search":
+                            query = str(args.get("query", ""))
+                            yield sse({"type": "status", "text": f"Searching the web for {query}"})
+                            found = await web_search(query)
+                            for hit in found:
+                                sources.append(
+                                    {"n": len(sources) + 1, "doc": hit["title"] or hit["url"],
+                                     "page": None, "text": hit["text"], "url": hit["url"]}
+                                )
+                                hit["n"] = len(sources)
+                            if found:
+                                yield sse({"type": "sources", "sources": sources})
+                                result = "\n\n".join(
+                                    f"[{h['n']}] {h['title']} ({h['url']})\n{h['text']}" for h in found
+                                )
                             else:
-                                result = f"There is no tool called {c['name']}."
-                        except Exception as exc:
-                            result = f"The tool failed ({exc.__class__.__name__}). Tell the user live data is unavailable right now."
-                        if round_no == MAX_TOOL_ROUNDS - 1:
-                            # The next round has no tools; without this the model may
-                            # write another tool call as plain text instead of answering.
-                            result += (
-                                "\n\n(No more tool calls are available. Answer the user now from the "
-                                "results so far; if they do not settle the question, say so.)"
-                            )
-                        messages.append(
-                            {"role": "tool", "tool_call_id": c["id"] or f"call_{round_no}_{i}", "content": result}
+                                result = (
+                                    "The search returned no results. Tell the user the search failed and "
+                                    "answer from what you know, saying it may be out of date."
+                                )
+                        else:
+                            result = f"There is no tool called {c['name']}."
+                    except Exception as exc:
+                        result = f"The tool failed ({exc.__class__.__name__}). Tell the user live data is unavailable right now."
+                    if round_no == MAX_TOOL_ROUNDS - 1:
+                        # The next round has no tools; without this the model may
+                        # write another tool call as plain text instead of answering.
+                        result += (
+                            "\n\n(No more tool calls are available. Answer the user now from the "
+                            "results so far; if they do not settle the question, say so.)"
                         )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": c["id"] or f"call_{round_no}_{i}", "content": result}
+                    )
         except httpx.HTTPError as exc:
             yield sse({"type": "error", "message": f"Lost the connection to the model service ({exc.__class__.__name__}). Send again."})
             return
