@@ -622,6 +622,13 @@ async def chat(req: ChatRequest, request: Request):
                                 result = f"There is no tool called {c['name']}."
                         except Exception as exc:
                             result = f"The tool failed ({exc.__class__.__name__}). Tell the user live data is unavailable right now."
+                        if round_no == MAX_TOOL_ROUNDS - 1:
+                            # The next round has no tools; without this the model may
+                            # write another tool call as plain text instead of answering.
+                            result += (
+                                "\n\n(No more tool calls are available. Answer the user now from the "
+                                "results so far; if they do not settle the question, say so.)"
+                            )
                         messages.append(
                             {"role": "tool", "tool_call_id": c["id"] or f"call_{round_no}_{i}", "content": result}
                         )
