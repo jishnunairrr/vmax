@@ -1,0 +1,14 @@
+# Render blueprint: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: vmax
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/status
+    envVars:
+      - key: NVIDIA_API_KEY
+        sync: false   # entered in the Render dashboard, never stored in the repo
+      - key: PYTHON_VERSION
+        value: 3.11.9

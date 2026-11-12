@@ -23,6 +23,10 @@ Open http://localhost:8000.
 
 On macOS or Linux, use `.venv/bin/python` in place of `.venv\Scripts\python.exe`.
 
+## Host it online
+
+The repository includes a `render.yaml` blueprint for [Render](https://render.com). Create a Blueprint from this repository in the Render dashboard and enter `NVIDIA_API_KEY` when asked. On the free plan the app sleeps when idle and uploaded documents are cleared on each restart.
+
 ## How it works
 
 - `app.py` is the server. An uploaded file is split into passages, each passage is embedded, and the vectors are saved under `data/`. A question is embedded the same way, the closest passages are sent to the chat model along with the question, and the answer streams back.
