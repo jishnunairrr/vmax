@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>V-max</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Documents and settings">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="1" y="1" width="22" height="22" rx="6"/><path d="M7 7.5l5 9 5-9" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>V-max</span>
+    </div>
+
+    <button class="btn btn-quiet" id="new-chat" type="button">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      New chat
+    </button>
+
+    <section class="docs" aria-labelledby="docs-title">
+      <h2 id="docs-title">Documents</h2>
+      <label class="drop" id="drop">
+        <input type="file" id="file-input" multiple accept=".pdf,.docx,.txt,.md,.csv">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V5m0 0-4 4m4-4 4 4M5 19h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <strong>Add a document</strong>
+        <span>Drop a file here or browse. PDF, Word, text or CSV, up to 25 MB.</span>
+      </label>
+      <ul class="doc-list" id="doc-list"></ul>
+      <p class="docs-empty" id="docs-empty">Nothing added yet. Add a document and answers will quote it, with page references.</p>
+    </section>
+
+    <div class="side-foot">
+      <span class="dot" id="key-dot"></span>
+      <span id="key-text">Checking connection</span>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menu-btn" type="button" aria-label="Show documents">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5.5h14M3 10h14M3 14.5h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+
+    <div class="banner" id="banner" hidden>
+      <strong>Add your API key to start.</strong>
+      Copy <code>.env.example</code> to <code>.env</code> in the project folder and paste your NVIDIA API key into it.
+      <button class="btn-link" id="recheck" type="button">Check again</button>
+    </div>
+
+    <div class="scroll" id="scroll">
+      <div class="thread" id="thread">
+        <div class="welcome" id="welcome">
+          <h1>What are we up to today?</h1>
+        </div>
+      </div>
+    </div>
+
+    <form class="composer" id="composer">
+      <div class="composer-box">
+        <textarea id="input" rows="1" placeholder="Ask anything" aria-label="Your message"></textarea>
+        <div class="composer-row">
+          <label class="doc-toggle" id="doc-toggle" hidden>
+            <input type="checkbox" id="use-docs" checked>
+            <span class="switch" aria-hidden="true"></span>
+            <span id="doc-toggle-text">Answer from documents</span>
+          </label>
+          <button class="send" id="send" type="submit" aria-label="Send message">
+            <svg class="i-send" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 16V4m0 0L5 9m5-5 5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <svg class="i-stop" viewBox="0 0 20 20" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="currentColor"/></svg>
+          </button>
+        </div>
+      </div>
+      <p class="hint">Enter to send, Shift + Enter for a new line. Check important answers against the source.</p>
+    </form>
+  </main>
+</div>
+
+<div class="toast" id="toast" role="alert" hidden></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
