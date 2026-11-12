@@ -4,6 +4,7 @@ Run:  python -m uvicorn app:app --port 8000
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import secrets
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -37,6 +39,8 @@ CHUNK_SIZE = 1100          # characters per chunk
 CHUNK_OVERLAP = 150
 TOP_K = 6                  # chunks sent to the model per question
 EMBED_BATCH = 32
+MAX_TOOL_ROUNDS = 3        # tool calls the model may chain per question
+MAX_WEB_RESULTS = 5
 SUPPORTED = {".pdf", ".docx", ".txt", ".md", ".csv"}
 
 DEFAULT_CHAT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
@@ -55,6 +59,15 @@ RAG_SYSTEM = (
     "If the excerpts do not contain the answer, say so plainly, then answer from "
     "general knowledge only if you can, marking it as not from the documents. "
     "Never invent citations. Use Markdown when it helps readability."
+)
+TOOLS_NOTE = (
+    " Today's date is {today}. You have two tools: get_weather gives the current "
+    "weather and a short forecast for a place, and web_search finds news, prices, "
+    "scores and anything recent or likely to have changed. Use them whenever a "
+    "question needs live or up-to-date information instead of saying you cannot "
+    "access it; do not use them for things you already know. Web results arrive "
+    "numbered; cite the ones you use inline with that number in square brackets, "
+    "like [3]."
 )
 
 
@@ -264,6 +277,112 @@ async def embed(texts: list[str], input_type: str, cfg: dict) -> np.ndarray:
     return vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12)
 
 
+# ------------------------------------------------------------------- tools --
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Current weather and a 3-day forecast for a city or place.",
+            "parameters": {
+                "type": "object",
+                "properties": {"place": {"type": "string", "description": "City or place name, e.g. 'Kochi' or 'Paris, France'"}},
+                "required": ["place"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current or recent information: news, prices, scores, events, facts that may have changed.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "A short, specific search query"}},
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+WEATHER_CODES = {
+    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast", 45: "fog", 48: "freezing fog",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle", 56: "freezing drizzle", 57: "freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light rain showers", 81: "rain showers", 82: "violent rain showers", 85: "snow showers", 86: "heavy snow showers",
+    95: "thunderstorm", 96: "thunderstorm with hail", 99: "thunderstorm with heavy hail",
+}
+
+
+async def get_weather(place: str) -> str:
+    """Live weather from Open-Meteo (free, no key)."""
+    place = place.strip()
+    async with httpx.AsyncClient(timeout=20) as client:
+        spot = None
+        for name in dict.fromkeys([place, place.split(",")[0].strip()]):
+            res = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search", params={"name": name, "count": 1}
+            )
+            found = res.json().get("results") if res.status_code == 200 else None
+            if found:
+                spot = found[0]
+                break
+        if not spot:
+            return f"No place called '{place}' was found. Ask the user to check the spelling."
+        res = await client.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": spot["latitude"],
+                "longitude": spot["longitude"],
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                "timezone": "auto",
+                "forecast_days": 3,
+            },
+        )
+        if res.status_code != 200:
+            return "The weather service did not respond. Try again shortly."
+        data = res.json()
+    now, daily = data["current"], data["daily"]
+    where = ", ".join(x for x in (spot.get("name"), spot.get("admin1"), spot.get("country")) if x)
+    lines = [
+        f"Weather for {where} (local time {now['time'].replace('T', ' ')}, source: Open-Meteo)",
+        f"Now: {WEATHER_CODES.get(now['weather_code'], 'unknown')}, {now['temperature_2m']} C "
+        f"(feels like {now['apparent_temperature']} C), humidity {now['relative_humidity_2m']}%, "
+        f"wind {now['wind_speed_10m']} km/h, precipitation {now['precipitation']} mm",
+    ]
+    for i, day in enumerate(daily["time"]):
+        lines.append(
+            f"{day}: {WEATHER_CODES.get(daily['weather_code'][i], 'unknown')}, "
+            f"{daily['temperature_2m_min'][i]} to {daily['temperature_2m_max'][i]} C, "
+            f"rain chance {daily['precipitation_probability_max'][i]}%"
+        )
+    return "\n".join(lines)
+
+
+def _search_sync(query: str) -> list[dict]:
+    from ddgs import DDGS
+
+    for backend in ("yahoo", "bing", "google", "auto"):  # each engine fails often; try in turn
+        try:
+            rows = DDGS(timeout=12).text(query, max_results=MAX_WEB_RESULTS, backend=backend)
+        except Exception:
+            continue
+        results = [
+            {"title": r.get("title", ""), "url": r.get("href", ""), "text": r.get("body", "")}
+            for r in rows or []
+            if r.get("href")
+        ]
+        if results:
+            return results
+    return []
+
+
+async def web_search(query: str) -> list[dict]:
+    return await asyncio.to_thread(_search_sync, query.strip())
+
+
 # --------------------------------------------------------------------- api --
 app = FastAPI(title="V-max")
 
@@ -401,41 +520,111 @@ async def chat(req: ChatRequest, request: Request):
         else:
             messages.append({"role": "user", "content": question})
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2 if sources else 0.6,
-            "top_p": 0.95,
-            "max_tokens": 4096,
-            "stream": True,
-        }
+        today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
+        messages[0]["content"] += TOOLS_NOTE.format(today=today)
         headers = {"Authorization": f"Bearer {cfg['key']}", "Accept": "text/event-stream"}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=20)) as client:
-                async with client.stream(
-                    "POST", f"{cfg['base']}/chat/completions", json=payload, headers=headers
-                ) as res:
-                    if res.status_code != 200:
-                        body = (await res.aread()).decode("utf-8", errors="ignore")
-                        yield sse({"type": "error", "message": nvidia_error(res.status_code, body)})
-                        return
-                    async for line in res.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            break
+                for round_no in range(MAX_TOOL_ROUNDS + 1):
+                    payload = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": 0.2 if sources else 0.6,
+                        "top_p": 0.95,
+                        "max_tokens": 4096,
+                        "stream": True,
+                    }
+                    if round_no < MAX_TOOL_ROUNDS:  # the last round must answer
+                        payload["tools"] = TOOLS
+                        payload["tool_choice"] = "auto"
+                    calls: dict[int, dict] = {}
+                    said = ""
+                    async with client.stream(
+                        "POST", f"{cfg['base']}/chat/completions", json=payload, headers=headers
+                    ) as res:
+                        if res.status_code != 200:
+                            body = (await res.aread()).decode("utf-8", errors="ignore")
+                            yield sse({"type": "error", "message": nvidia_error(res.status_code, body)})
+                            return
+                        async for line in res.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                choices = json.loads(data).get("choices") or []
+                            except json.JSONDecodeError:
+                                continue
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta") or {}
+                            for part in delta.get("tool_calls") or []:
+                                call = calls.setdefault(part.get("index", 0), {"id": "", "name": "", "args": ""})
+                                fn = part.get("function") or {}
+                                call["id"] = part.get("id") or call["id"]
+                                call["name"] += fn.get("name") or ""
+                                call["args"] += fn.get("arguments") or ""
+                            if delta.get("content"):
+                                said += delta["content"]
+                                yield sse({"type": "token", "text": delta["content"]})
+                            elif delta.get("reasoning_content") or delta.get("reasoning"):
+                                yield sse({"type": "thinking"})
+                    if not calls:
+                        break
+
+                    ordered = [calls[i] for i in sorted(calls)]
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": said,
+                            "tool_calls": [
+                                {
+                                    "id": c["id"] or f"call_{round_no}_{i}",
+                                    "type": "function",
+                                    "function": {"name": c["name"], "arguments": c["args"] or "{}"},
+                                }
+                                for i, c in enumerate(ordered)
+                            ],
+                        }
+                    )
+                    for i, c in enumerate(ordered):
                         try:
-                            choices = json.loads(data).get("choices") or []
+                            args = json.loads(c["args"] or "{}")
                         except json.JSONDecodeError:
-                            continue
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta") or {}
-                        if delta.get("content"):
-                            yield sse({"type": "token", "text": delta["content"]})
-                        elif delta.get("reasoning_content") or delta.get("reasoning"):
-                            yield sse({"type": "thinking"})
+                            args = {}
+                        try:
+                            if c["name"] == "get_weather":
+                                place = str(args.get("place", ""))
+                                yield sse({"type": "status", "text": f"Checking the weather in {place}"})
+                                result = await get_weather(place)
+                            elif c["name"] == "web_search":
+                                query = str(args.get("query", ""))
+                                yield sse({"type": "status", "text": f"Searching the web for {query}"})
+                                found = await web_search(query)
+                                for hit in found:
+                                    sources.append(
+                                        {"n": len(sources) + 1, "doc": hit["title"] or hit["url"],
+                                         "page": None, "text": hit["text"], "url": hit["url"]}
+                                    )
+                                    hit["n"] = len(sources)
+                                if found:
+                                    yield sse({"type": "sources", "sources": sources})
+                                    result = "\n\n".join(
+                                        f"[{h['n']}] {h['title']} ({h['url']})\n{h['text']}" for h in found
+                                    )
+                                else:
+                                    result = (
+                                        "The search returned no results. Tell the user the search failed and "
+                                        "answer from what you know, saying it may be out of date."
+                                    )
+                            else:
+                                result = f"There is no tool called {c['name']}."
+                        except Exception as exc:
+                            result = f"The tool failed ({exc.__class__.__name__}). Tell the user live data is unavailable right now."
+                        messages.append(
+                            {"role": "tool", "tool_call_id": c["id"] or f"call_{round_no}_{i}", "content": result}
+                        )
         except httpx.HTTPError as exc:
             yield sse({"type": "error", "message": f"Lost the connection to the model service ({exc.__class__.__name__}). Send again."})
             return

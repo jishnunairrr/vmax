@@ -185,7 +185,9 @@ button { cursor: pointer; }
   padding: 4px 10px 4px 4px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font-size: 13px;
 }
 .source b { display: grid; place-items: center; min-width: 20px; height: 20px; border-radius: 5px; background: var(--signal-wash); color: var(--signal-ink); font-size: 11.5px; }
-.source span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.source span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 240px; }
+.excerpt-head a { color: var(--signal-ink); }
+.pending span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .source:hover, .source.on { border-color: var(--signal); }
 .excerpt {
   margin-top: 10px; padding: 12px 14px; border-radius: 10px; background: var(--surface);

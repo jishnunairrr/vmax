@@ -228,10 +228,17 @@ function renderAnswer(bot, text, sources, final) {
     excerpt.dataset.n = n;
     bot.wrap.querySelectorAll(".cite, .source").forEach((b) => b.classList.toggle("on", !excerpt.hidden && +b.dataset.n === n));
     if (excerpt.hidden) return;
-    excerpt.replaceChildren(
-      el("div", "excerpt-head", s.doc + (s.page ? `, page ${s.page}` : "")),
-      el("div", "excerpt-text", s.text),
-    );
+    const head = el("div", "excerpt-head");
+    if (s.url && /^https?:\/\//.test(s.url)) {
+      const link = el("a", null, s.doc);
+      link.href = s.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      head.append(link);
+    } else {
+      head.textContent = s.doc + (s.page ? `, page ${s.page}` : "");
+    }
+    excerpt.replaceChildren(head, el("div", "excerpt-text", s.text));
     if (scrollTo) excerpt.scrollIntoView({ block: "nearest" });
   };
 
@@ -240,7 +247,7 @@ function renderAnswer(bot, text, sources, final) {
   const shown = cited.size ? sources.filter((s) => cited.has(s.n)) : sources;
 
   const box = el("div", "sources");
-  box.append(el("div", "sources-title", cited.size ? "Sources cited" : "Passages searched"));
+  box.append(el("div", "sources-title", cited.size ? "Sources cited" : "Sources checked"));
   chips = el("div", "source-chips");
   for (const s of shown) {
     const b = el("button", "source");
@@ -314,6 +321,7 @@ async function send(text) {
         if (!raw.startsWith("data:")) continue;
         const ev = JSON.parse(raw.slice(5));
         if (ev.type === "sources") { sources = ev.sources; bot.label.textContent = "Reading your documents"; }
+        else if (ev.type === "status") { if (!answer) bot.label.textContent = ev.text; }
         else if (ev.type === "thinking") { if (!answer) bot.label.textContent = "Thinking"; }
         else if (ev.type === "token") { answer += ev.text; if (!frame) frame = requestAnimationFrame(paint); }
         else if (ev.type === "error") failed = ev.message;

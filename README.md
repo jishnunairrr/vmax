@@ -30,6 +30,7 @@ The repository includes a `render.yaml` blueprint for [Render](https://render.co
 ## How it works
 
 - `app.py` is the server. An uploaded file is split into passages, each passage is embedded, and the vectors are saved under `data/`. A question is embedded the same way, the closest passages are sent to the chat model along with the question, and the answer streams back.
+- For live questions the model can call two tools: a weather lookup (Open-Meteo, no key needed) and a web search (free search engines through the `ddgs` library, tried in turn because each one fails some of the time). Web results appear as numbered sources with links.
 - `static/` is the interface.
 
 ## Settings
