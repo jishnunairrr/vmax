@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import secrets
 import time
 import uuid
 from pathlib import Path
@@ -15,7 +16,7 @@ from pathlib import Path
 import httpx
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -135,16 +136,23 @@ class Store:
         (DATA_DIR / f"{doc_id}.npy").unlink(missing_ok=True)
         self.save_index()
 
-    def summary(self) -> list[dict]:
-        return [
-            {k: d[k] for k in ("id", "name", "pages", "chunk_count", "size", "added")}
-            for d in sorted(self.docs.values(), key=lambda d: d["added"])
-        ]
+    @staticmethod
+    def public(doc: dict) -> dict:
+        return {k: doc[k] for k in ("id", "name", "pages", "chunk_count", "size", "added")}
 
-    def search(self, query_vec: np.ndarray, k: int, embed_model: str) -> list[dict]:
+    def owned(self, owner: str) -> list[dict]:
+        """Documents uploaded by this visitor, oldest first."""
+        docs = [d for d in self.docs.values() if d.get("owner") == owner]
+        return sorted(docs, key=lambda d: d["added"])
+
+    def summary(self, owner: str) -> list[dict]:
+        return [self.public(d) for d in self.owned(owner)]
+
+    def search(self, query_vec: np.ndarray, k: int, embed_model: str, owner: str) -> list[dict]:
         hits = []
         q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
-        for doc_id, doc in self.docs.items():
+        for doc in self.owned(owner):
+            doc_id = doc["id"]
             vecs = self.vectors[doc_id]
             if doc.get("embed_model") != embed_model or vecs.shape[1] != q.shape[0]:
                 continue  # embedded with a different model; not comparable
@@ -259,6 +267,24 @@ async def embed(texts: list[str], input_type: str, cfg: dict) -> np.ndarray:
 # --------------------------------------------------------------------- api --
 app = FastAPI(title="V-max")
 
+VISITOR_COOKIE = "vmax_visitor"
+
+
+@app.middleware("http")
+async def visitor_cookie(request: Request, call_next):
+    """Give each browser a random id so its documents stay private to it."""
+    visitor = request.cookies.get(VISITOR_COOKIE, "")
+    is_new = not re.fullmatch(r"[0-9a-f]{32}", visitor)
+    if is_new:
+        visitor = secrets.token_hex(16)
+    request.state.visitor = visitor
+    response = await call_next(request)
+    if is_new:
+        response.set_cookie(
+            VISITOR_COOKIE, visitor, max_age=365 * 24 * 3600, httponly=True, samesite="lax"
+        )
+    return response
+
 
 class Message(BaseModel):
     role: str
@@ -282,12 +308,12 @@ def status():
 
 
 @app.get("/api/documents")
-def list_documents():
-    return {"documents": store.summary()}
+def list_documents(request: Request):
+    return {"documents": store.summary(request.state.visitor)}
 
 
 @app.post("/api/documents")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(request: Request, file: UploadFile = File(...)):
     name = Path(file.filename or "document").name
     ext = Path(name).suffix.lower()
     if ext not in SUPPORTED:
@@ -320,15 +346,16 @@ async def upload_document(file: UploadFile = File(...)):
         "size": len(raw),
         "added": time.time(),
         "embed_model": cfg["embed_model"],
+        "owner": request.state.visitor,
         "chunks": chunks,
     }
     store.add(doc, vectors)
-    return store.summary()[-1]
+    return store.public(doc)
 
 
 @app.delete("/api/documents/{doc_id}")
-def delete_document(doc_id: str):
-    if doc_id not in store.docs:
+def delete_document(doc_id: str, request: Request):
+    if store.docs.get(doc_id, {}).get("owner") != request.state.visitor:
         raise HTTPException(404, "Document not found.")
     store.remove(doc_id)
     return {"ok": True}
@@ -339,20 +366,21 @@ def sse(event: dict) -> str:
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
     cfg = require_key()
     history = [m for m in req.messages if m.role in ("user", "assistant") and m.content.strip()]
     if not history or history[-1].role != "user":
         raise HTTPException(400, "Send a question to get an answer.")
     question = history[-1].content
     model = (req.model or cfg["chat_model"]).strip()
+    visitor = request.state.visitor
 
     async def stream():
         sources: list[dict] = []
-        if req.use_documents and store.docs:
+        if req.use_documents and store.owned(visitor):
             try:
                 query_vec = (await embed([question], "query", cfg))[0]
-                sources = store.search(query_vec, TOP_K, cfg["embed_model"])
+                sources = store.search(query_vec, TOP_K, cfg["embed_model"], visitor)
             except HTTPException as exc:
                 yield sse({"type": "error", "message": exc.detail})
                 return
